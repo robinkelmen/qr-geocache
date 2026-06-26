@@ -1,0 +1,331 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QR → video · the process is the video</title>
+<link rel="manifest" href="manifest.json">
+<script>if('serviceWorker' in navigator){navigator.serviceWorker.register('sw.js').catch(()=>{});}</script>
+<style>
+  :root { --bg:#0a0b10; --ink:#e8eaf2; --dim:#7b8094; --acc:#52e0c4; --line:#1d2030; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; }
+  .wrap { max-width:760px; margin:0 auto; padding:24px 18px 60px; }
+  h1 { font-size:18px; font-weight:600; letter-spacing:.2px; margin:0 0 2px; }
+  .sub { color:var(--dim); font-size:12.5px; margin:0 0 20px; }
+  .sub b { color:var(--acc); font-weight:600; }
+  .stage { position:relative; aspect-ratio:1/1; width:100%; background:#000; border:1px solid var(--line);
+           border-radius:14px; overflow:hidden; }
+  canvas { width:100%; height:100%; display:block; image-rendering:auto; }
+  #cam { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; display:none; }
+  .scanline { position:absolute; left:0; right:0; height:2px; background:var(--acc); box-shadow:0 0 12px var(--acc);
+              display:none; animation:scan 2.2s linear infinite; }
+  .msg { position:absolute; inset:0; display:none; flex-direction:column; align-items:center; justify-content:center;
+         text-align:center; padding:8% 7%; pointer-events:none; }
+  .msg .mt { font-size:clamp(22px,6vw,52px); font-weight:800; letter-spacing:.5px; line-height:1.12; color:#fff;
+             text-shadow:0 2px 30px rgba(0,0,0,.85), 0 0 40px rgba(120,180,255,.5); animation:rise 1.4s ease both; }
+  .msg .ms { margin-top:14px; font-size:clamp(13px,3.2vw,20px); font-weight:500; color:#eef;
+             text-shadow:0 2px 18px rgba(0,0,0,.9); animation:rise 1.4s .25s ease both; }
+  @keyframes rise { from{opacity:0; transform:translateY(14px)} to{opacity:1; transform:none} }
+  .crawl { position:absolute; inset:0; display:none; overflow:hidden; perspective:300px; }
+  .crawl-mask { position:absolute; inset:0; z-index:3; pointer-events:none;
+                background:linear-gradient(#000 0%, rgba(0,0,0,.0) 42%); }
+  .crawl-3d { position:absolute; left:6%; right:6%; top:100%; transform-origin:50% 100%;
+              transform:rotateX(56deg); color:#ffd23f; text-align:justify; animation:crawl 50s linear infinite; }
+  .crawl-3d h2 { text-align:center; font-size:clamp(20px,5.4vw,40px); font-weight:800; letter-spacing:1px; margin:0 0 22px; }
+  .crawl-3d p { font-size:clamp(15px,3.8vw,26px); font-weight:700; line-height:1.5; margin:0 0 16px; }
+  @keyframes crawl { from{top:100%} to{top:-320%} }
+  @keyframes scan { 0%{top:6%;opacity:.9} 50%{top:94%;opacity:.9} 100%{top:6%;opacity:.9} }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin:14px 0 0; }
+  button { background:#12131c; color:var(--ink); border:1px solid var(--line); padding:9px 13px; border-radius:9px;
+           cursor:pointer; font:inherit; transition:.15s; }
+  button:hover { border-color:var(--acc); color:var(--acc); }
+  button.primary { background:var(--acc); color:#04201a; border-color:var(--acc); font-weight:600; }
+  .status { margin-top:14px; padding:10px 12px; border:1px solid var(--line); border-radius:9px; color:var(--dim);
+            font-size:12.5px; min-height:38px; }
+  .status b { color:var(--ink); }
+  .seedbox { width:100%; margin-top:10px; background:#0d0e16; color:var(--dim); border:1px solid var(--line);
+             border-radius:9px; padding:9px; font:11px/1.45 ui-monospace,monospace; height:74px; resize:vertical; }
+  input[type=file] { display:none; }
+  .pill { display:inline-block; padding:1px 7px; border:1px solid var(--line); border-radius:99px; color:var(--acc); font-size:11px; }
+  a { color:var(--acc); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>QR → video</h1>
+  <p class="sub">Point your camera at the code, or upload it. The square holds the <b>functions</b>, not the pixels.
+     Your browser runs them and the film plays. <b>No server. No network.</b></p>
+
+  <div class="stage">
+    <video id="cam" playsinline muted></video>
+    <video id="film" playsinline loop controls style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000;display:none"></video>
+    <canvas id="screen" width="480" height="480"></canvas>
+    <img id="still" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000;display:none">
+    <div class="scanline" id="scanline"></div>
+    <div id="msg" class="msg"><div class="mt" id="msgT"></div><div class="ms" id="msgS"></div></div>
+    <div id="crawl" class="crawl"><div class="crawl-mask"></div>
+      <div class="crawl-3d" id="crawl3d"><h2 id="crawlTitle"></h2><div id="crawlBody"></div></div></div>
+  </div>
+
+  <div class="row">
+    <button class="primary" id="btnCam">📷 Scan with camera</button>
+    <button id="btnFile">🖼 Upload a QR image</button>
+    <button id="btnPlay" style="display:none">⏸ Pause</button>
+    <span class="pill" id="kindPill" style="display:none"></span>
+  </div>
+
+  <div class="status" id="status">Waiting for a seed. Scan a QR, upload one, or paste a seed below.</div>
+  <textarea class="seedbox" id="seedText" placeholder='…or paste a seed JSON here and it plays instantly'></textarea>
+
+  <input type="file" id="file" accept="image/*" multiple>
+</div>
+
+<script src="jsQR.embed.js"></script>
+<script>
+// ============================================================================
+// THE INTERPRETERS — three function-languages a seed can be written in.
+// Each is (seed, internalW, internalH, t) -> fills an RGBA buffer. The seed is
+// the program; this is the player; running it over t IS the video.
+// ============================================================================
+const clamp01 = v => v<0?0:v>1?1:v;
+
+// --- language A: FIELD (kernels + folds; e.g. "aurora") ---------------------
+function hash2(ix,iy){let h=(ix*374761393+iy*668265263)|0;h=(h^(h>>>13))*1274126177;h=h^(h>>>16);return ((h>>>0)/4294967295)*2-1;}
+function noise(x,y){const x0=Math.floor(x),y0=Math.floor(y),fx=x-x0,fy=y-y0,sx=fx*fx*(3-2*fx),sy=fy*fy*(3-2*fy);
+  const n00=hash2(x0,y0),n10=hash2(x0+1,y0),n01=hash2(x0,y0+1),n11=hash2(x0+1,y0+1);
+  return (n00*(1-sx)+n10*sx)*(1-sy)+(n01*(1-sx)+n11*sx)*sy;}
+function applyFolds(folds,x,y,t){let amp=1;for(const f of folds||[]){
+  if(f.f==="spin"){const a=(f.rate||0)*t,c=Math.cos(a),s=Math.sin(a);[x,y]=[x*c-y*s,x*s+y*c];}
+  else if(f.f==="drift"){x+=(f.dx||0)*t;y+=(f.dy||0)*t;}
+  else if(f.f==="warp"){x+=(f.a||0)*Math.sin((f.b||1)*y+(f.speed||0)*t);y+=(f.a||0)*Math.sin((f.b||1)*x+(f.speed||0)*t);}
+  else if(f.f==="pulse"){amp*=0.5+0.5*Math.sin((f.rate||1)*t+(f.phase||0));}}return [x,y,amp];}
+function evalKernel(L,x0,y0,t){const [x,y,amp]=applyFolds(L.fold,x0,y0,t);const k=L.k;let v=0;
+  if(k==="wave"){const d=L.dir||0,u=x*Math.cos(d)+y*Math.sin(d);v=Math.sin((L.freq||6)*u+(L.speed||1)*t+(L.phase||0));}
+  else if(k==="ring"){const r=Math.sqrt(x*x+y*y);v=Math.sin((L.freq||8)*r-(L.speed||1)*t+(L.phase||0));}
+  else if(k==="noise"){const sc=L.freq||3;v=noise(x*sc+(L.speed||0)*t,y*sc-(L.speed||0)*t);}
+  else if(k==="checker"){const sc=L.freq||4;v=(Math.floor((x+1)*sc)+Math.floor((y+1)*sc))%2?1:-1;}
+  return v*amp*(L.amp??1);}
+function palette(stops,s){s=clamp01(s);const st=stops&&stops.length?stops:[[10,12,30],[120,60,200],[240,230,255]];
+  const n=st.length-1,f=s*n,i=Math.min(n-1,Math.floor(f)),g=f-i,a=st[i],b=st[i+1];
+  return [Math.round(a[0]+(b[0]-a[0])*g),Math.round(a[1]+(b[1]-a[1])*g),Math.round(a[2]+(b[2]-a[2])*g)];}
+function renderField(seed,W,H,t,buf){let o=0;const asp=W/H;
+  for(let py=0;py<H;py++)for(let px=0;px<W;px++){const x=((px+0.5)/W*2-1)*asp,y=(py+0.5)/H*2-1;let acc=0;
+    for(const L of seed.layers){const v=evalKernel(L,x,y,t),bl=L.blend||"add";
+      if(bl==="add")acc+=v;else if(bl==="mul")acc=acc===0?v:acc*v;
+      else if(bl==="screen")acc=1-(1-clamp01((acc+1)/2))*(1-clamp01((v+1)/2));}
+    const s=0.5+0.5*Math.tanh(acc*(seed.gain??1)),[r,g,b]=palette(seed.palette,s);
+    buf[(py*W+px)*4]=r;buf[(py*W+px)*4+1]=g;buf[(py*W+px)*4+2]=b;buf[(py*W+px)*4+3]=255;}}
+
+// --- language B: SPORE (closed-form 3D field flown through in t) -------------
+function sporeField(S,x,y,z){const [wa,wf,wc]=S.warp;
+  const xw=x+wa*Math.sin(wf*y+wc*z),yw=y+wa*Math.sin(wf*z+wc*x),zw=z+wa*Math.sin(wf*x+wc*y);let acc=0;
+  for(const [f,ax,ay,az,ph] of S.waves)acc+=Math.sin(f*(ax*xw+ay*yw+az*zw)+ph);return Math.tanh(acc*S.gain);}
+function renderSpore(S,W,H,t,buf){const [cz,cx,cy,crot]=S.cam,zc=cz*t,xc=cx*t,yc=cy*t,a=crot*t,ca=Math.cos(a),sa=Math.sin(a),asp=W/H;let o=0;
+  for(let py=0;py<H;py++){const v0=(py+0.5)/H*2-1;for(let px=0;px<W;px++){const u0=((px+0.5)/W*2-1)*asp;
+    const u=u0*ca-v0*sa+xc,v=u0*sa+v0*ca+yc,s=0.5+0.5*sporeField(S,u,v,zc+0.6*Math.sin(1.7*u)),[r,g,b]=palette(S.palette,s);
+    buf[o++]=r;buf[o++]=g;buf[o++]=b;buf[o++]=255;}}}
+
+// --- language C: MACHINE (pool of point-functions + a which-next sequencer) --
+const det=i=>{let h=(i*2654435761)>>>0;h^=h>>>15;h=(h*2246822519)>>>0;h^=h>>>13;return (h>>>0)/4294967295;};
+const TAU=Math.PI*2;
+const MOPS={
+  field({n=800,hue=[40,50,70]}){const p=[];for(let i=0;i<n;i++){const x=det(i*3+1)*2-1,y=det(i*3+2)*2-1,b=0.4+0.6*det(i*3+3);p.push([x,y,hue[0]*b,hue[1]*b,hue[2]*b]);}return p;},
+  body({n=300,fx=3,fy=2,rate=0.5,rad=0.6,color=[255,180,90]},t){const p=[];for(let i=0;i<n;i++){const u=(i/n)*TAU,a=u+rate*t;p.push([rad*Math.sin(fx*a),rad*Math.sin(fy*a+1),color[0],color[1],color[2]]);}return p;},
+  swirl({rate=0.4},t,pts){const a=rate*t,c=Math.cos(a),s=Math.sin(a);return pts.map(([x,y,r,g,b])=>[x*c-y*s,x*s+y*c,r,g,b]);},
+  drift({dx=0,dy=0},t,pts){return pts.map(([x,y,r,g,b])=>[x+dx*Math.sin(t),y+dy*t*0.1,r,g,b]);},
+  tint({rate=1,amt=0.5},t,pts){const m=1+amt*Math.sin(rate*t);return pts.map(([x,y,r,g,b])=>[x,y,Math.min(255,r*m),Math.min(255,g/m),b]);},
+};
+function pipelineFor(prog,t){if(prog.scenes){for(const sc of prog.scenes)if(t<sc.until)return sc.chain;return prog.scenes[prog.scenes.length-1].chain;}return prog.chain;}
+function renderMachine(prog,W,H,t,buf){const chain=pipelineFor(prog,t);let pts=[];
+  for(const step of chain){const fn=MOPS[step.op];if(!fn)continue;if(fn.length===3)pts=fn(step,t,pts);else pts=pts.concat(fn(step,t));}
+  const acc=new Float32Array(W*H*3),asp=W/H;
+  for(const [x,y,r,g,b] of pts){const px=Math.round((x/asp*0.5+0.5)*(W-1)),py=Math.round((y*0.5+0.5)*(H-1));
+    if(px<0||px>=W||py<0||py>=H)continue;const o=(py*W+px)*3;acc[o]+=r;acc[o+1]+=g;acc[o+2]+=b;}
+  for(let i=0;i<W*H;i++){buf[i*4]=Math.min(255,acc[i*3]);buf[i*4+1]=Math.min(255,acc[i*3+1]);buf[i*4+2]=Math.min(255,acc[i*3+2]);buf[i*4+3]=255;}}
+
+// --- dispatch: detect which language the seed is written in ------------------
+function detectKind(s){ if(s.kind==="image"||s.src) return "image"; if(s.kind==="crawl"||s.crawl) return "crawl"; if(s.kind==="spore"||s.waves) return "spore"; if(s.kind==="machine"||s.scenes||s.chain) return "machine"; if(s.layers) return "field"; return null; }
+// deterministic starfield for the crawl background (cheap 2D, twinkles in t)
+function drawStars(ctx,W,H,t,seed){
+  ctx.fillStyle="#000"; ctx.fillRect(0,0,W,H);
+  const n=seed.stars||160;
+  for(let i=0;i<n;i++){ const hx=Math.sin(i*127.1+ (seed.starseed||1))*43758.5; const hy=Math.sin(i*311.7+9.7)*24634.6;
+    const x=(hx-Math.floor(hx))*W, y=(hy-Math.floor(hy))*H;
+    const a=0.4+0.6*Math.abs(Math.sin(t*1.5+i)); const r=(i%9===0)?1.6:0.9;
+    ctx.fillStyle="rgba(255,255,255,"+a.toFixed(2)+")"; ctx.beginPath(); ctx.arc(x,y,r,0,6.28); ctx.fill(); }
+}
+const KIND_RES = { field:200, spore:200, machine:380 };
+
+// ============================================================================
+// PLAYER
+// ============================================================================
+const screen=document.getElementById("screen"), sctx=screen.getContext("2d");
+const cam=document.getElementById("cam"), statusEl=document.getElementById("status");
+const seedText=document.getElementById("seedText"), kindPill=document.getElementById("kindPill");
+const scanline=document.getElementById("scanline"), btnPlay=document.getElementById("btnPlay");
+const off=document.createElement("canvas"); let offctx, offimg;
+let current=null, kind=null, playing=false, t0=0, raf=0, scanning=false;
+
+function setStatus(html){ statusEl.innerHTML=html; }
+function ensureOff(res){ if(off.width!==res){off.width=off.height=res; offctx=off.getContext("2d"); offimg=offctx.createImageData(res,res);} }
+
+function loadSeed(obj){
+  kind=detectKind(obj);
+  if(!kind){ setStatus("⚠ Unrecognized seed — no known function-language in it."); return false; }
+  current=obj;
+  kindPill.style.display="inline-block";
+  kindPill.textContent=(obj.name||kind)+" · "+kind;
+  seedText.value=JSON.stringify(obj);
+  setStatus(`▶ <b>${obj.name||kind}</b> loaded — a <b>${JSON.stringify(obj).length}-byte</b> ${kind} program. Running the functions…`);
+  btnPlay.style.display="inline-block";
+  const msg=document.getElementById("msg"), crawl=document.getElementById("crawl"), still=document.getElementById("still");
+  if(kind==="image"){
+    // a real image / gif / comic — optionally with a caption (= a meme)
+    still.src=obj.src; still.style.display="block"; screen.style.display="none"; crawl.style.display="none";
+    if(obj.text){ document.getElementById("msgT").textContent=obj.text; document.getElementById("msgS").textContent=obj.sub||""; msg.style.display="flex"; }
+    else { msg.style.display="none"; }
+    playing=false; cancelAnimationFrame(raf); btnPlay.style.display="none";
+    setStatus(`▶ <b>${obj.name||"image"}</b> — a real image carried in the code (${JSON.stringify(obj).length} B). The browser shows it. No server.`);
+    return true;
+  }
+  still.style.display="none"; screen.style.display="block";
+  if(kind==="crawl"){
+    document.getElementById("crawlTitle").textContent=obj.title||"";
+    const body=document.getElementById("crawlBody"); body.innerHTML="";
+    (obj.text||"").split(/\n\s*\n/).forEach(par=>{ const p=document.createElement("p"); p.textContent=par.trim(); body.appendChild(p); });
+    const c3=document.getElementById("crawl3d"); c3.style.animation="none"; void c3.offsetWidth; c3.style.animation="";  // restart
+    crawl.style.display="block"; msg.style.display="none"; screen.style.display="block";
+  } else {
+    crawl.style.display="none";
+    // optional message overlay (the "aura invite" — text rides in the seed)
+    if(obj.text){ document.getElementById("msgT").textContent=obj.text; document.getElementById("msgS").textContent=obj.sub||""; msg.style.display="flex"; }
+    else { msg.style.display="none"; }
+  }
+  startPlay();
+  return true;
+}
+function frame(now){
+  if(!playing) return;
+  const t=(now-t0)/1000*1.1;
+  if(kind==="crawl"){ drawStars(sctx,screen.width,screen.height,t,current); raf=requestAnimationFrame(frame); return; }
+  const res=KIND_RES[kind]; ensureOff(res);
+  if(kind==="field") renderField(current,res,res,t,offimg.data);
+  else if(kind==="spore") renderSpore(current,res,res,t,offimg.data);
+  else renderMachine(current,res,res,t,offimg.data);
+  offctx.putImageData(offimg,0,0);
+  sctx.imageSmoothingEnabled = kind!=="machine";
+  sctx.drawImage(off,0,0,screen.width,screen.height);
+  raf=requestAnimationFrame(frame);
+}
+function startPlay(){ playing=true; t0=performance.now(); btnPlay.textContent="⏸ Pause"; cancelAnimationFrame(raf); raf=requestAnimationFrame(frame); }
+btnPlay.onclick=()=>{ playing=!playing; if(playing){t0=performance.now(); btnPlay.textContent="⏸ Pause"; raf=requestAnimationFrame(frame);} else {cancelAnimationFrame(raf); btnPlay.textContent="▶ Play";} };
+
+const film=document.getElementById("film");
+
+// --- chained-package reassembly: QV|<id>|<i>|<n>|<slice> ---------------------
+// A full file (gif/video/image/data) is split across N QR codes. Each carries a
+// package id + its index + total. Scan the chain (any order); when all N arrive,
+// reassemble and play. id prevents mixing two packages.
+let chunks=null, chunkN=0, chunkId=null;
+function resetChunks(){ chunks=null; chunkN=0; chunkId=null; }
+function handleChunk(text){
+  const m=text.match(/^QV\|([^|]+)\|(\d+)\|(\d+)\|([\s\S]*)$/); if(!m) return false;
+  const id=m[1], i=+m[2], n=+m[3], slice=m[4];
+  if(chunkId!==id || !chunks || chunkN!==n){ chunks=new Array(n).fill(null); chunkN=n; chunkId=id; }
+  if(chunks[i]==null) chunks[i]=slice;
+  const got=chunks.filter(x=>x!=null).length;
+  setStatus(`📦 following the chain: <b>${got}/${n}</b> codes scanned…`);
+  if(got===n) assemblePackage();
+  return true;
+}
+function assemblePackage(){
+  const payload=chunks.join("");
+  const nl=payload.indexOf("\n");
+  const mime=payload.slice(0,nl), b64=payload.slice(nl+1);
+  const bin=atob(b64); const bytes=new Uint8Array(bin.length);
+  for(let i=0;i<bin.length;i++) bytes[i]=bin.charCodeAt(i);
+  const blob=new Blob([bytes],{type:mime});
+  if(mime.indexOf("image")===0) playStill(blob, bytes.length, mime);   // gif/png/jpg (gif animates)
+  else playVideo(blob, bytes.length, mime);                            // webm/mp4
+  resetChunks();
+}
+function playStill(blob, nbytes, mime){
+  playing=false; cancelAnimationFrame(raf);
+  screen.style.display="none"; cam.style.display="none"; film.style.display="none";
+  document.getElementById("msg").style.display="none"; document.getElementById("crawl").style.display="none";
+  const still=document.getElementById("still"); still.src=URL.createObjectURL(blob); still.style.display="block";
+  kindPill.style.display="inline-block"; kindPill.textContent=mime; btnPlay.style.display="none";
+  setStatus(`▶ <b>real ${mime.indexOf("gif")>=0?"GIF":"image"}</b> — ${nbytes.toLocaleString()} B reassembled from the QR chain, played offline. <b>No server.</b>`);
+}
+function playVideo(blob, nbytes, mime){
+  playing=false; cancelAnimationFrame(raf);   // stop the procedural loop
+  screen.style.display="none"; cam.style.display="none"; film.style.display="block";
+  document.getElementById("msg").style.display="none"; document.getElementById("still").style.display="none";
+  film.src=URL.createObjectURL(blob); film.play().catch(()=>{});
+  kindPill.style.display="inline-block"; kindPill.textContent="real video · "+mime;
+  btnPlay.style.display="none";
+  setStatus(`▶ <b>real video</b> playing — ${nbytes.toLocaleString()} B reassembled from QR codes, decoded by the browser. <b>No server, no network.</b>`);
+}
+
+// --- decode a QR from an RGBA image buffer; route text -> seed or chunk -------
+// returns "seed" | "chunk" | null
+function tryDecode(data,w,h){
+  const r=jsQR(data,w,h); if(!(r&&r.data)) return null;
+  const txt=r.data.trim();
+  if(txt.startsWith("QV|")){ handleChunk(txt); return "chunk"; }
+  try{ const o=JSON.parse(txt); if(detectKind(o)){ film.style.display="none"; film.pause&&film.pause(); loadSeed(o); return "seed"; } }
+  catch(e){ setStatus("⚠ QR decoded but it isn't a seed or a video chunk."); }
+  return null;
+}
+
+// --- camera scanning --------------------------------------------------------
+async function scanCamera(){
+  try{
+    const stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"}});
+    cam.srcObject=stream; cam.style.display="block"; screen.style.display="none"; scanline.style.display="block";
+    await cam.play(); scanning=true; setStatus("📷 Point at a QR code…");
+    const sc=document.createElement("canvas"); const cx=sc.getContext("2d",{willReadFrequently:true});
+    const tick=()=>{ if(!scanning) return;
+      if(cam.videoWidth){ sc.width=cam.videoWidth; sc.height=cam.videoHeight; cx.drawImage(cam,0,0);
+        const img=cx.getImageData(0,0,sc.width,sc.height); const kindFound=tryDecode(img.data,sc.width,sc.height);
+        if(kindFound==="seed"){ stopCamera(); return; }            // single procedural seed: done
+        if(film.style.display==="block"){ stopCamera(); return; }  // video fully assembled: done
+      }
+      requestAnimationFrame(tick); };
+    requestAnimationFrame(tick);
+  }catch(e){ setStatus("⚠ Camera unavailable ("+e.message+"). Use “Upload a QR image” instead."); }
+}
+function stopCamera(){ scanning=false; scanline.style.display="none"; if(cam.srcObject){cam.srcObject.getTracks().forEach(t=>t.stop());} cam.style.display="none"; screen.style.display="block"; }
+
+// --- file upload (one image = a seed; many images = a video's QR grid) ------
+async function decodeFiles(files){
+  resetChunks();
+  const list=[...files].sort((a,b)=>a.name.localeCompare(b.name));
+  setStatus(`🖼 Decoding ${list.length} image(s)…`);
+  let any=false;
+  for(const file of list){
+    const bmp=await createImageBitmap(file);
+    const sc=document.createElement("canvas"); sc.width=bmp.width; sc.height=bmp.height;
+    const cx=sc.getContext("2d",{willReadFrequently:true}); cx.drawImage(bmp,0,0);
+    const img=cx.getImageData(0,0,bmp.width,bmp.height);
+    if(tryDecode(img.data,bmp.width,bmp.height)) any=true;
+  }
+  if(!any) setStatus("⚠ No QR seed or video chunks found in those images.");
+}
+
+// --- wiring -----------------------------------------------------------------
+document.getElementById("btnCam").onclick=scanCamera;
+document.getElementById("btnFile").onclick=()=>document.getElementById("file").click();
+document.getElementById("file").onchange=e=>{ if(e.target.files.length) decodeFiles(e.target.files); };
+seedText.addEventListener("input",()=>{ try{ const o=JSON.parse(seedText.value); if(detectKind(o)) loadSeed(o); }catch(e){} });
+
+// share/test path: #<json> or #<base64-json> in the URL loads a seed with no camera
+function b64utf8(s){ const bin=atob(s); const bytes=Uint8Array.from(bin,c=>c.charCodeAt(0)); return new TextDecoder().decode(bytes); }
+function fromHash(){ if(!location.hash) return; let s=decodeURIComponent(location.hash.slice(1));
+  try{ loadSeed(JSON.parse(s)); return; }catch(e){}
+  try{ loadSeed(JSON.parse(b64utf8(s))); }catch(e){} }
+window.addEventListener("hashchange",fromHash); fromHash();
+</script>
+</body>
+</html>

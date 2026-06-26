@@ -1,0 +1,9 @@
+{
+  "name": "QR Video Player",
+  "short_name": "QR Video",
+  "start_url": "./qr-video.html",
+  "display": "standalone",
+  "background_color": "#0a0b10",
+  "theme_color": "#0a0b10",
+  "description": "Scan a QR seed, the browser unfolds it into video. Works offline."
+}
