@@ -5,7 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>QR → video · the process is the video</title>
 <link rel="manifest" href="manifest.json">
-<script>if('serviceWorker' in navigator){navigator.serviceWorker.register('sw.js').catch(()=>{});}</script>
+<script>
+if('serviceWorker' in navigator){ navigator.serviceWorker.register('sw.js').then(()=>{
+  var n=document.getElementById('ctxNote'); if(n) n.textContent="✓ installed — works offline now.";
+}).catch(()=>{
+  var n=document.getElementById('ctxNote');
+  if(n) n.textContent=(location.protocol!=='https:')?"⚠ over plain HTTP: offline + in-app camera need HTTPS.":"";
+}); }
+</script>
 <style>
   :root { --bg:#0a0b10; --ink:#e8eaf2; --dim:#7b8094; --acc:#52e0c4; --line:#1d2030; }
   * { box-sizing:border-box; }
@@ -55,7 +62,8 @@
 <div class="wrap">
   <h1>QR → video</h1>
   <p class="sub">Point your camera at the code, or upload it. The square holds the <b>functions</b>, not the pixels.
-     Your browser runs them and the film plays. <b>No server. No network.</b></p>
+     Your browser runs them and the film plays. <b>No server at play time</b> — one visit installs the player, then it runs offline.
+     <span id="ctxNote"></span></p>
 
   <div class="stage">
     <video id="cam" playsinline muted></video>
@@ -106,6 +114,8 @@ function evalKernel(L,x0,y0,t){const [x,y,amp]=applyFolds(L.fold,x0,y0,t);const 
   else if(k==="ring"){const r=Math.sqrt(x*x+y*y);v=Math.sin((L.freq||8)*r-(L.speed||1)*t+(L.phase||0));}
   else if(k==="noise"){const sc=L.freq||3;v=noise(x*sc+(L.speed||0)*t,y*sc-(L.speed||0)*t);}
   else if(k==="checker"){const sc=L.freq||4;v=(Math.floor((x+1)*sc)+Math.floor((y+1)*sc))%2?1:-1;}
+  else if(k==="spiral"){const r=Math.sqrt(x*x+y*y),ang=Math.atan2(y,x);v=Math.sin((L.freq||6)*r+(L.arms||1)*ang+(L.speed||1)*t+(L.phase||0));}
+  else if(k==="blob"){const cx=(L.ax||0)*Math.sin((L.speed||1)*t),cy=(L.ay||0)*Math.cos((L.speed||1)*t),d=Math.sqrt((x-cx)*(x-cx)+(y-cy)*(y-cy))-(L.rad||0.3);v=Math.tanh(-(L.sharp||4)*d);}
   return v*amp*(L.amp??1);}
 function palette(stops,s){s=clamp01(s);const st=stops&&stops.length?stops:[[10,12,30],[120,60,200],[240,230,255]];
   const n=st.length-1,f=s*n,i=Math.min(n-1,Math.floor(f)),g=f-i,a=st[i],b=st[i+1];
@@ -149,7 +159,8 @@ float TANH(float x){ x=clamp(x,-10.0,10.0); float e=exp(2.0*x); return (e-1.0)/(
 ${glPal(s.palette)}`;
 const GUV=`float asp=R.x/R.y; vec2 uv=vec2((gl_FragCoord.x/R.x*2.0-1.0)*asp, -(gl_FragCoord.y/R.y*2.0-1.0));`;
 function glFieldFrag(s){ const L=s.layers||[];
-  if(L.some(l=>l.k!=="wave"&&l.k!=="ring"&&l.k!=="spiral")) return null;   // noise/checker -> JS
+  // GPU only for add-blended wave/ring/spiral; everything else (noise/checker/blob/mul/screen) -> JS, never silently wrong
+  if(L.some(l=>(l.k!=="wave"&&l.k!=="ring"&&l.k!=="spiral")||(l.blend&&l.blend!=="add"))) return null;
   let body="";
   for(const l of L){ body+=" { vec2 q=uv; float am=1.0;\n";
     for(const f of (l.fold||[])){
@@ -176,6 +187,7 @@ function glBuild(seed,kind){ if(!glInit()) return false;
   const src = kind==="field"?glFieldFrag(seed): kind==="spore"?glSporeFrag(seed): null;
   if(!src){ glProg=null; return false; }
   try{ const g=GL.g;
+    if(glProg&&glProg.p){ g.deleteProgram(glProg.p); }   // free the previous program (no leak on seed change)
     const vs=g.createShader(g.VERTEX_SHADER); g.shaderSource(vs,"attribute vec2 p;void main(){gl_Position=vec4(p,0.0,1.0);}"); g.compileShader(vs);
     const fs=g.createShader(g.FRAGMENT_SHADER); g.shaderSource(fs,src); g.compileShader(fs);
     if(!g.getShaderParameter(fs,g.COMPILE_STATUS)){ console.warn("GLSL:",g.getShaderInfoLog(fs)); glProg=null; return false; }
@@ -200,15 +212,22 @@ const MOPS={
   tint({rate=1,amt=0.5},t,pts){const m=1+amt*Math.sin(rate*t);return pts.map(([x,y,r,g,b])=>[x,y,Math.min(255,r*m),Math.min(255,g/m),b]);},
 };
 function pipelineFor(prog,t){if(prog.scenes){for(const sc of prog.scenes)if(t<sc.until)return sc.chain;return prog.scenes[prog.scenes.length-1].chain;}return prog.chain;}
+let _macc=null,_maccN=0;   // reused accumulator — no 1.7MB/frame GC churn
 function renderMachine(prog,W,H,t,buf){const chain=pipelineFor(prog,t);let pts=[];
-  for(const step of chain){const fn=MOPS[step.op];if(!fn)continue;if(fn.length===3)pts=fn(step,t,pts);else pts=pts.concat(fn(step,t));}
-  const acc=new Float32Array(W*H*3),asp=W/H;
+  for(const step of chain){const fn=MOPS[step.op];if(!fn)continue;if(fn.length===3)pts=fn(step,t,pts);else{const s=fn(step,t);for(let k=0;k<s.length;k++)pts.push(s[k]);}}
+  if(_maccN!==W*H*3){_macc=new Float32Array(W*H*3);_maccN=W*H*3;}else _macc.fill(0); const acc=_macc,asp=W/H;
   for(const [x,y,r,g,b] of pts){const px=Math.round((x/asp*0.5+0.5)*(W-1)),py=Math.round((y*0.5+0.5)*(H-1));
     if(px<0||px>=W||py<0||py>=H)continue;const o=(py*W+px)*3;acc[o]+=r;acc[o+1]+=g;acc[o+2]+=b;}
   for(let i=0;i<W*H;i++){buf[i*4]=Math.min(255,acc[i*3]);buf[i*4+1]=Math.min(255,acc[i*3+1]);buf[i*4+2]=Math.min(255,acc[i*3+2]);buf[i*4+3]=255;}}
 
 // --- dispatch: detect which language the seed is written in ------------------
-function detectKind(s){ if(s.kind==="image"||s.src) return "image"; if(s.kind==="crawl"||s.crawl) return "crawl"; if(s.kind==="spore"||s.waves) return "spore"; if(s.kind==="machine"||s.scenes||s.chain) return "machine"; if(s.layers) return "field"; return null; }
+function detectKind(s){
+  const k=s.dec||s.kind;                                   // explicit discriminant wins (seed contract)
+  if(k==="spectral"||k==="function") return "unsupported"; // known but needs the extended player
+  if(k && ["field","spore","machine","crawl","image"].indexOf(k)>=0) return k;
+  if(s.src) return "image"; if(s.crawl) return "crawl"; if(s.waves) return "spore";
+  if(s.scenes||s.chain) return "machine"; if(s.layers) return "field"; return null;
+}
 // deterministic starfield for the crawl background (cheap 2D, twinkles in t)
 function drawStars(ctx,W,H,t,seed){
   ctx.fillStyle="#000"; ctx.fillRect(0,0,W,H);
@@ -234,16 +253,19 @@ function sizeGL(){ const css=Math.max(200, screen.clientWidth||480); const dpr=M
   const px=Math.min(1024, Math.round(css*dpr)); if(glcanvas.width!==px){ glcanvas.width=px; glcanvas.height=px; } }
 
 function setStatus(html){ statusEl.innerHTML=html; }
+const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");  // seed fields are untrusted
 function ensureOff(res){ if(off.width!==res){off.width=off.height=res; offctx=off.getContext("2d"); offimg=offctx.createImageData(res,res);} }
 
 function loadSeed(obj){
   kind=detectKind(obj);
+  if(kind==="unsupported"){ setStatus(`⚠ This is a <b>${esc(obj.dec||obj.kind)}</b> seed — it needs the extended player. This build runs procedural / image / crawl seeds.`); return false; }
   if(!kind){ setStatus("⚠ Unrecognized seed — no known function-language in it."); return false; }
+  if(obj.v && obj.v>1){ console.warn("seed v"+obj.v+" newer than player v1 — film may not match"); }
   current=obj;
   kindPill.style.display="inline-block";
   kindPill.textContent=(obj.name||kind)+" · "+kind;
   seedText.value=JSON.stringify(obj);
-  setStatus(`▶ <b>${obj.name||kind}</b> loaded — a <b>${JSON.stringify(obj).length}-byte</b> ${kind} program. Running the functions…`);
+  setStatus(`▶ <b>${esc(obj.name||kind)}</b> loaded — a <b>${JSON.stringify(obj).length}-byte</b> ${esc(kind)} program. Running the functions…`);
   btnPlay.style.display="inline-block";
   const msg=document.getElementById("msg"), crawl=document.getElementById("crawl"), still=document.getElementById("still");
   if(kind==="image"){
@@ -252,7 +274,7 @@ function loadSeed(obj){
     if(obj.text){ document.getElementById("msgT").textContent=obj.text; document.getElementById("msgS").textContent=obj.sub||""; msg.style.display="flex"; }
     else { msg.style.display="none"; }
     playing=false; cancelAnimationFrame(raf); btnPlay.style.display="none";
-    setStatus(`▶ <b>${obj.name||"image"}</b> — a real image carried in the code (${JSON.stringify(obj).length} B). The browser shows it. No server.`);
+    setStatus(`▶ <b>${esc(obj.name||"image")}</b> — a real image carried in the code (${JSON.stringify(obj).length} B). The browser shows it.`);
     return true;
   }
   still.style.display="none";
@@ -303,6 +325,7 @@ function resetChunks(){ chunks=null; chunkN=0; chunkId=null; }
 function handleChunk(text){
   const m=text.match(/^QV\|([^|]+)\|(\d+)\|(\d+)\|([\s\S]*)$/); if(!m) return false;
   const id=m[1], i=+m[2], n=+m[3], slice=m[4];
+  if(!(n>=1 && n<=512) || !(i>=0 && i<n)){ setStatus("⚠ Invalid chain code (bad index/total)."); return false; }
   if(chunkId!==id || !chunks || chunkN!==n){ chunks=new Array(n).fill(null); chunkN=n; chunkId=id; }
   if(chunks[i]==null) chunks[i]=slice;
   const got=chunks.filter(x=>x!=null).length;
