@@ -61,6 +61,7 @@
     <video id="cam" playsinline muted></video>
     <video id="film" playsinline loop controls style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000;display:none"></video>
     <canvas id="screen" width="480" height="480"></canvas>
+    <canvas id="gl" style="position:absolute;inset:0;width:100%;height:100%;display:none"></canvas>
     <img id="still" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000;display:none">
     <div class="scanline" id="scanline"></div>
     <div id="msg" class="msg"><div class="mt" id="msgT"></div><div class="ms" id="msgS"></div></div>
@@ -126,6 +127,68 @@ function renderSpore(S,W,H,t,buf){const [cz,cx,cy,crot]=S.cam,zc=cz*t,xc=cx*t,yc
     const u=u0*ca-v0*sa+xc,v=u0*sa+v0*ca+yc,s=0.5+0.5*sporeField(S,u,v,zc+0.6*Math.sin(1.7*u)),[r,g,b]=palette(S.palette,s);
     buf[o++]=r;buf[o++]=g;buf[o++]=b;buf[o++]=255;}}}
 
+// --- WEBGL FAST PATH: compile a seed's functions into a GPU fragment shader --
+// "The recipe becomes a shader." Full-res, 60fps on the GPU. Pure client GPU —
+// no server, no API. Falls back to the per-pixel JS path on any failure or for
+// kernels GLSL doesn't gen (noise/checker). The squeeze stays in the QR.
+let GL=null;
+function glInit(){ if(GL) return !!GL.ok; try{
+  const g=glcanvas.getContext("webgl",{antialias:false})||glcanvas.getContext("experimental-webgl");
+  if(!g){ GL={ok:false}; return false; }
+  const b=g.createBuffer(); g.bindBuffer(g.ARRAY_BUFFER,b);
+  g.bufferData(g.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),g.STATIC_DRAW);
+  GL={ok:true,g,buf:b}; return true;
+}catch(e){ GL={ok:false}; return false; } }
+const Gf=v=>{ v=+v; if(!isFinite(v))v=0; return Number.isInteger(v)?v.toFixed(1):String(v); };
+function glPal(pal){ pal=pal&&pal.length?pal:[[10,12,30],[120,60,200],[240,230,255]];
+  let s=`vec3 PAL(float t){ t=clamp(t,0.0,1.0)*${Gf(pal.length-1)};\n vec3 c=vec3(${Gf(pal[0][0]/255)},${Gf(pal[0][1]/255)},${Gf(pal[0][2]/255)});\n`;
+  for(let i=1;i<pal.length;i++) s+=` c=mix(c,vec3(${Gf(pal[i][0]/255)},${Gf(pal[i][1]/255)},${Gf(pal[i][2]/255)}),clamp(t-${Gf(i-1)},0.0,1.0));\n`;
+  return s+" return c; }\n"; }
+const GHEAD=s=>`precision highp float; uniform vec2 R; uniform float T;
+float TANH(float x){ x=clamp(x,-10.0,10.0); float e=exp(2.0*x); return (e-1.0)/(e+1.0); }
+${glPal(s.palette)}`;
+const GUV=`float asp=R.x/R.y; vec2 uv=vec2((gl_FragCoord.x/R.x*2.0-1.0)*asp, -(gl_FragCoord.y/R.y*2.0-1.0));`;
+function glFieldFrag(s){ const L=s.layers||[];
+  if(L.some(l=>l.k!=="wave"&&l.k!=="ring"&&l.k!=="spiral")) return null;   // noise/checker -> JS
+  let body="";
+  for(const l of L){ body+=" { vec2 q=uv; float am=1.0;\n";
+    for(const f of (l.fold||[])){
+      if(f.f==="warp") body+=`  q.x+=${Gf(f.a||0)}*sin(${Gf(f.b||1)}*q.y+${Gf(f.speed||0)}*T); q.y+=${Gf(f.a||0)}*sin(${Gf(f.b||1)}*q.x+${Gf(f.speed||0)}*T);\n`;
+      else if(f.f==="drift") body+=`  q+=vec2(${Gf(f.dx||0)}*T,${Gf(f.dy||0)}*T);\n`;
+      else if(f.f==="spin") body+=`  { float a=${Gf(f.rate||0)}*T; q=mat2(cos(a),sin(a),-sin(a),cos(a))*q; }\n`;
+      else if(f.f==="pulse") body+=`  am*=0.5+0.5*sin(${Gf(f.rate||1)}*T+${Gf(f.phase||0)});\n`;
+    }
+    let v; if(l.k==="wave") v=`sin(${Gf(l.freq||6)}*(q.x*cos(${Gf(l.dir||0)})+q.y*sin(${Gf(l.dir||0)}))+${Gf(l.speed||1)}*T+${Gf(l.phase||0)})`;
+    else if(l.k==="ring") v=`sin(${Gf(l.freq||8)}*length(q)-${Gf(l.speed||1)}*T+${Gf(l.phase||0)})`;
+    else v=`sin(${Gf(l.freq||6)}*length(q)+${Gf(l.arms||1)}*atan(q.y,q.x)+${Gf(l.speed||1)}*T+${Gf(l.phase||0)})`;
+    body+=`  acc+=(${v})*am*${Gf(l.amp??1)};\n }\n`; }
+  return `${GHEAD(s)}void main(){ ${GUV} float acc=0.0;\n${body} gl_FragColor=vec4(PAL(0.5+0.5*TANH(acc*${Gf(s.gain??1)})),1.0); }`;
+}
+function glSporeFrag(s){ const W=s.waves||[]; let w="";
+  for(const a of W) w+=` acc+=sin(${Gf(a[0])}*(${Gf(a[1])}*xw+${Gf(a[2])}*yw+${Gf(a[3])}*zw)+${Gf(a[4]||0)});\n`;
+  const [wa,wf,wc]=s.warp||[0.5,1.9,0.7]; const [cz,cx,cy,cr]=s.cam||[0.15,0.1,0.23,0.37];
+  return `${GHEAD(s)}float fld(float x,float y,float z){ float xw=x+${Gf(wa)}*sin(${Gf(wf)}*y+${Gf(wc)}*z); float yw=y+${Gf(wa)}*sin(${Gf(wf)}*z+${Gf(wc)}*x); float zw=z+${Gf(wa)}*sin(${Gf(wf)}*x+${Gf(wc)}*y); float acc=0.0;\n${w} return TANH(acc*${Gf(s.gain??1.25)}); }
+void main(){ ${GUV} float zc=${Gf(cz)}*T,xc=${Gf(cx)}*T,yc=${Gf(cy)}*T,a=${Gf(cr)}*T,ca=cos(a),sa=sin(a);
+ float u=uv.x*ca-uv.y*sa+xc, v=uv.x*sa+uv.y*ca+yc; gl_FragColor=vec4(PAL(0.5+0.5*fld(u,v,zc+0.6*sin(1.7*u))),1.0); }`;
+}
+let glProg=null;
+function glBuild(seed,kind){ if(!glInit()) return false;
+  const src = kind==="field"?glFieldFrag(seed): kind==="spore"?glSporeFrag(seed): null;
+  if(!src){ glProg=null; return false; }
+  try{ const g=GL.g;
+    const vs=g.createShader(g.VERTEX_SHADER); g.shaderSource(vs,"attribute vec2 p;void main(){gl_Position=vec4(p,0.0,1.0);}"); g.compileShader(vs);
+    const fs=g.createShader(g.FRAGMENT_SHADER); g.shaderSource(fs,src); g.compileShader(fs);
+    if(!g.getShaderParameter(fs,g.COMPILE_STATUS)){ console.warn("GLSL:",g.getShaderInfoLog(fs)); glProg=null; return false; }
+    const p=g.createProgram(); g.attachShader(p,vs); g.attachShader(p,fs); g.linkProgram(p);
+    if(!g.getProgramParameter(p,g.LINK_STATUS)){ glProg=null; return false; }
+    glProg={p, R:g.getUniformLocation(p,"R"), T:g.getUniformLocation(p,"T"), loc:g.getAttribLocation(p,"p")};
+    return true;
+  }catch(e){ glProg=null; return false; } }
+function glRender(t){ const g=GL.g, W=glcanvas.width, H=glcanvas.height;
+  g.viewport(0,0,W,H); g.useProgram(glProg.p);
+  g.bindBuffer(g.ARRAY_BUFFER,GL.buf); g.enableVertexAttribArray(glProg.loc); g.vertexAttribPointer(glProg.loc,2,g.FLOAT,false,0,0);
+  g.uniform2f(glProg.R,W,H); g.uniform1f(glProg.T,t); g.drawArrays(g.TRIANGLES,0,3); }
+
 // --- language C: MACHINE (pool of point-functions + a which-next sequencer) --
 const det=i=>{let h=(i*2654435761)>>>0;h^=h>>>15;h=(h*2246822519)>>>0;h^=h>>>13;return (h>>>0)/4294967295;};
 const TAU=Math.PI*2;
@@ -161,11 +224,14 @@ const KIND_RES = { field:200, spore:200, machine:380 };
 // PLAYER
 // ============================================================================
 const screen=document.getElementById("screen"), sctx=screen.getContext("2d");
+const glcanvas=document.getElementById("gl");
 const cam=document.getElementById("cam"), statusEl=document.getElementById("status");
 const seedText=document.getElementById("seedText"), kindPill=document.getElementById("kindPill");
 const scanline=document.getElementById("scanline"), btnPlay=document.getElementById("btnPlay");
 const off=document.createElement("canvas"); let offctx, offimg;
-let current=null, kind=null, playing=false, t0=0, raf=0, scanning=false;
+let current=null, kind=null, playing=false, t0=0, raf=0, scanning=false, useGL=false;
+function sizeGL(){ const css=Math.max(200, screen.clientWidth||480); const dpr=Math.min(window.devicePixelRatio||1,2);
+  const px=Math.min(1024, Math.round(css*dpr)); if(glcanvas.width!==px){ glcanvas.width=px; glcanvas.height=px; } }
 
 function setStatus(html){ statusEl.innerHTML=html; }
 function ensureOff(res){ if(off.width!==res){off.width=off.height=res; offctx=off.getContext("2d"); offimg=offctx.createImageData(res,res);} }
@@ -182,14 +248,18 @@ function loadSeed(obj){
   const msg=document.getElementById("msg"), crawl=document.getElementById("crawl"), still=document.getElementById("still");
   if(kind==="image"){
     // a real image / gif / comic — optionally with a caption (= a meme)
-    still.src=obj.src; still.style.display="block"; screen.style.display="none"; crawl.style.display="none";
+    still.src=obj.src; still.style.display="block"; screen.style.display="none"; crawl.style.display="none"; glcanvas.style.display="none"; useGL=false;
     if(obj.text){ document.getElementById("msgT").textContent=obj.text; document.getElementById("msgS").textContent=obj.sub||""; msg.style.display="flex"; }
     else { msg.style.display="none"; }
     playing=false; cancelAnimationFrame(raf); btnPlay.style.display="none";
     setStatus(`▶ <b>${obj.name||"image"}</b> — a real image carried in the code (${JSON.stringify(obj).length} B). The browser shows it. No server.`);
     return true;
   }
-  still.style.display="none"; screen.style.display="block";
+  still.style.display="none";
+  useGL=(kind==="field"||kind==="spore")&&glBuild(obj,kind);   // compile seed -> GPU shader
+  if(useGL) sizeGL();
+  glcanvas.style.display=useGL?"block":"none";
+  screen.style.display=useGL?"none":"block";
   if(kind==="crawl"){
     document.getElementById("crawlTitle").textContent=obj.title||"";
     const body=document.getElementById("crawlBody"); body.innerHTML="";
@@ -208,6 +278,7 @@ function loadSeed(obj){
 function frame(now){
   if(!playing) return;
   const t=(now-t0)/1000*1.1;
+  if(useGL){ glRender(t); raf=requestAnimationFrame(frame); return; }   // GPU fast path
   if(kind==="crawl"){ drawStars(sctx,screen.width,screen.height,t,current); raf=requestAnimationFrame(frame); return; }
   const res=KIND_RES[kind]; ensureOff(res);
   if(kind==="field") renderField(current,res,res,t,offimg.data);
@@ -260,7 +331,7 @@ function playStill(blob, nbytes, mime){
 }
 function playVideo(blob, nbytes, mime){
   playing=false; cancelAnimationFrame(raf);   // stop the procedural loop
-  screen.style.display="none"; cam.style.display="none"; film.style.display="block";
+  screen.style.display="none"; cam.style.display="none"; film.style.display="block"; useGL=false; glcanvas.style.display="none";
   document.getElementById("msg").style.display="none"; document.getElementById("still").style.display="none";
   film.src=URL.createObjectURL(blob); film.play().catch(()=>{});
   kindPill.style.display="inline-block"; kindPill.textContent="real video · "+mime;
