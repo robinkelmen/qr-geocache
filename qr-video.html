@@ -147,7 +147,8 @@ function glInit(){ if(GL) return !!GL.ok; try{
   if(!g){ GL={ok:false}; return false; }
   const b=g.createBuffer(); g.bindBuffer(g.ARRAY_BUFFER,b);
   g.bufferData(g.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),g.STATIC_DRAW);
-  GL={ok:true,g,buf:b}; return true;
+  const vs=g.createShader(g.VERTEX_SHADER); g.shaderSource(vs,"attribute vec2 p;void main(){gl_Position=vec4(p,0.0,1.0);}"); g.compileShader(vs);
+  GL={ok:true,g,buf:b,vs}; return true;   // vertex shader compiled once, reused for every program
 }catch(e){ GL={ok:false}; return false; } }
 const Gf=v=>{ v=+v; if(!isFinite(v))v=0; return Number.isInteger(v)?v.toFixed(1):String(v); };
 function glPal(pal){ pal=pal&&pal.length?pal:[[10,12,30],[120,60,200],[240,230,255]];
@@ -156,11 +157,14 @@ function glPal(pal){ pal=pal&&pal.length?pal:[[10,12,30],[120,60,200],[240,230,2
   return s+" return c; }\n"; }
 const GHEAD=s=>`precision highp float; uniform vec2 R; uniform float T;
 float TANH(float x){ x=clamp(x,-10.0,10.0); float e=exp(2.0*x); return (e-1.0)/(e+1.0); }
+float HSH(vec2 p){ p=floor(p); return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453)*2.0-1.0; }
+float NOISE(vec2 x){ vec2 i=floor(x), f=fract(x), u=f*f*(3.0-2.0*f);
+ return mix(mix(HSH(i),HSH(i+vec2(1.0,0.0)),u.x), mix(HSH(i+vec2(0.0,1.0)),HSH(i+vec2(1.0,1.0)),u.x), u.y); }
 ${glPal(s.palette)}`;
 const GUV=`float asp=R.x/R.y; vec2 uv=vec2((gl_FragCoord.x/R.x*2.0-1.0)*asp, -(gl_FragCoord.y/R.y*2.0-1.0));`;
 function glFieldFrag(s){ const L=s.layers||[];
-  // GPU only for add-blended wave/ring/spiral; everything else (noise/checker/blob/mul/screen) -> JS, never silently wrong
-  if(L.some(l=>(l.k!=="wave"&&l.k!=="ring"&&l.k!=="spiral")||(l.blend&&l.blend!=="add"))) return null;
+  // GPU for add-blended wave/ring/spiral/noise/checker; blob + mul/screen -> JS (never silently wrong)
+  if(L.some(l=>l.k==="blob"||(l.blend&&l.blend!=="add"))) return null;
   let body="";
   for(const l of L){ body+=" { vec2 q=uv; float am=1.0;\n";
     for(const f of (l.fold||[])){
@@ -169,9 +173,13 @@ function glFieldFrag(s){ const L=s.layers||[];
       else if(f.f==="spin") body+=`  { float a=${Gf(f.rate||0)}*T; q=mat2(cos(a),sin(a),-sin(a),cos(a))*q; }\n`;
       else if(f.f==="pulse") body+=`  am*=0.5+0.5*sin(${Gf(f.rate||1)}*T+${Gf(f.phase||0)});\n`;
     }
-    let v; if(l.k==="wave") v=`sin(${Gf(l.freq||6)}*(q.x*cos(${Gf(l.dir||0)})+q.y*sin(${Gf(l.dir||0)}))+${Gf(l.speed||1)}*T+${Gf(l.phase||0)})`;
-    else if(l.k==="ring") v=`sin(${Gf(l.freq||8)}*length(q)-${Gf(l.speed||1)}*T+${Gf(l.phase||0)})`;
-    else v=`sin(${Gf(l.freq||6)}*length(q)+${Gf(l.arms||1)}*atan(q.y,q.x)+${Gf(l.speed||1)}*T+${Gf(l.phase||0)})`;
+    let v; const k=l.k;
+    if(k==="wave") v=`sin(${Gf(l.freq||6)}*(q.x*cos(${Gf(l.dir||0)})+q.y*sin(${Gf(l.dir||0)}))+${Gf(l.speed||1)}*T+${Gf(l.phase||0)})`;
+    else if(k==="ring") v=`sin(${Gf(l.freq||8)}*length(q)-${Gf(l.speed||1)}*T+${Gf(l.phase||0)})`;
+    else if(k==="spiral") v=`sin(${Gf(l.freq||6)}*length(q)+${Gf(l.arms||1)}*atan(q.y,q.x)+${Gf(l.speed||1)}*T+${Gf(l.phase||0)})`;
+    else if(k==="noise") v=`NOISE(vec2(q.x*${Gf(l.freq||3)}+${Gf(l.speed||0)}*T, q.y*${Gf(l.freq||3)}-${Gf(l.speed||0)}*T))`;
+    else if(k==="checker") v=`(mod(floor((q.x+1.0)*${Gf(l.freq||4)})+floor((q.y+1.0)*${Gf(l.freq||4)}),2.0)>0.5?1.0:-1.0)`;
+    else v="0.0";
     body+=`  acc+=(${v})*am*${Gf(l.amp??1)};\n }\n`; }
   return `${GHEAD(s)}void main(){ ${GUV} float acc=0.0;\n${body} gl_FragColor=vec4(PAL(0.5+0.5*TANH(acc*${Gf(s.gain??1)})),1.0); }`;
 }
@@ -188,17 +196,19 @@ function glBuild(seed,kind){ if(!glInit()) return false;
   if(!src){ glProg=null; return false; }
   try{ const g=GL.g;
     if(glProg&&glProg.p){ g.deleteProgram(glProg.p); }   // free the previous program (no leak on seed change)
-    const vs=g.createShader(g.VERTEX_SHADER); g.shaderSource(vs,"attribute vec2 p;void main(){gl_Position=vec4(p,0.0,1.0);}"); g.compileShader(vs);
     const fs=g.createShader(g.FRAGMENT_SHADER); g.shaderSource(fs,src); g.compileShader(fs);
-    if(!g.getShaderParameter(fs,g.COMPILE_STATUS)){ console.warn("GLSL:",g.getShaderInfoLog(fs)); glProg=null; return false; }
-    const p=g.createProgram(); g.attachShader(p,vs); g.attachShader(p,fs); g.linkProgram(p);
-    if(!g.getProgramParameter(p,g.LINK_STATUS)){ glProg=null; return false; }
-    glProg={p, R:g.getUniformLocation(p,"R"), T:g.getUniformLocation(p,"T"), loc:g.getAttribLocation(p,"p")};
+    if(!g.getShaderParameter(fs,g.COMPILE_STATUS)){ console.warn("GLSL:",g.getShaderInfoLog(fs)); g.deleteShader(fs); glProg=null; return false; }
+    const p=g.createProgram(); g.attachShader(p,GL.vs); g.attachShader(p,fs); g.linkProgram(p);
+    g.deleteShader(fs);   // attached → safe to flag for delete after link
+    if(!g.getProgramParameter(p,g.LINK_STATUS)){ g.deleteProgram(p); glProg=null; return false; }
+    const loc=g.getAttribLocation(p,"p");
+    glProg={p, R:g.getUniformLocation(p,"R"), T:g.getUniformLocation(p,"T"), loc};
+    // VAO-equivalent state set ONCE per program, not per frame
+    g.useProgram(p); g.bindBuffer(g.ARRAY_BUFFER,GL.buf); g.enableVertexAttribArray(loc); g.vertexAttribPointer(loc,2,g.FLOAT,false,0,0);
     return true;
   }catch(e){ glProg=null; return false; } }
 function glRender(t){ const g=GL.g, W=glcanvas.width, H=glcanvas.height;
   g.viewport(0,0,W,H); g.useProgram(glProg.p);
-  g.bindBuffer(g.ARRAY_BUFFER,GL.buf); g.enableVertexAttribArray(glProg.loc); g.vertexAttribPointer(glProg.loc,2,g.FLOAT,false,0,0);
   g.uniform2f(glProg.R,W,H); g.uniform1f(glProg.T,t); g.drawArrays(g.TRIANGLES,0,3); }
 
 // --- language C: MACHINE (pool of point-functions + a which-next sequencer) --
@@ -251,6 +261,7 @@ const off=document.createElement("canvas"); let offctx, offimg;
 let current=null, kind=null, playing=false, t0=0, raf=0, scanning=false, useGL=false;
 function sizeGL(){ const css=Math.max(200, screen.clientWidth||480); const dpr=Math.min(window.devicePixelRatio||1,2);
   const px=Math.min(1024, Math.round(css*dpr)); if(glcanvas.width!==px){ glcanvas.width=px; glcanvas.height=px; } }
+if(window.ResizeObserver){ new ResizeObserver(()=>{ if(useGL) sizeGL(); }).observe(screen); }  // track rotate/resize
 
 function setStatus(html){ statusEl.innerHTML=html; }
 const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");  // seed fields are untrusted
