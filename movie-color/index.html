@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Color QR = 4-second movie (3× the data)</title>
+<style>
+  :root{ color-scheme: dark; }
+  body{ margin:0; background:#0a0b10; color:#e8e8ee; font:15px/1.5 ui-monospace,Menlo,monospace; padding:18px; max-width:760px; margin:0 auto; }
+  h1{ font-size:20px; margin:.2em 0 .1em; }
+  p{ color:#aab; margin:.3em 0; }
+  .accent{ color:#5fe3b0; font-weight:700; }
+  .stage{ margin:14px 0; background:#000; border-radius:14px; overflow:hidden; aspect-ratio:4/3; display:flex; align-items:center; justify-content:center; }
+  video{ width:100%; height:100%; object-fit:contain; image-rendering:pixelated; background:#000; }
+  #status{ color:#5fe3b0; min-height:1.4em; }
+  .row{ display:flex; gap:14px; align-items:center; flex-wrap:wrap; margin-top:12px; }
+  .qr{ width:170px; height:170px; image-rendering:pixelated; border-radius:10px; background:#fff; padding:4px; box-sizing:border-box; }
+  button{ font:inherit; background:#10b981; color:#04261c; font-weight:700; border:0; border-radius:9px; padding:11px 16px; }
+  button.alt{ background:#1b2030; color:#e8e8ee; border:1px solid #2c3550; }
+  #cam{ width:100%; max-width:360px; border-radius:12px; display:none; }
+  canvas#work{ display:none; }
+</style>
+</head>
+<body>
+  <h1>Color QR → a 4-second movie</h1>
+  <p>One code, <span class="accent">three QRs stacked in Red/Green/Blue</span> = <span class="accent">3× the data</span>
+     (~8.6 KB). Your browser splits the colors back out and plays the film — no server.</p>
+
+  <div class="stage"><video id="film" playsinline muted loop controls></video></div>
+  <div id="status">decoding the color QR…</div>
+
+  <div class="row">
+    <img class="qr" id="qrimg" src="colorqr.png" alt="the color QR that is the movie">
+    <div style="flex:1;min-width:220px">
+      <p><button id="scanBtn">📷 Scan a color QR with the camera</button></p>
+      <p style="color:#889;font-size:13px">↤ this is the color code. The colors aren't decoration — each RGB channel is a full separate QR.</p>
+      <p><button class="alt" id="replay">▶ replay</button> <a href="onemovie_color.mp4" style="color:#9fd">direct .mp4</a></p>
+    </div>
+  </div>
+  <video id="cam" playsinline></video>
+  <canvas id="work"></canvas>
+
+<script src="jsQR.embed.js"></script>
+<script>
+const film=document.getElementById('film'), status=document.getElementById('status');
+const cam=document.getElementById('cam'), work=document.getElementById('work'), wx=work.getContext('2d',{willReadFrequently:true});
+
+// --- decode a COLOR QR (3 QRs in R/G/B) from an ImageData -> Uint8Array | null ---
+function decodeColorQR(data, w, h){
+  const chunks={}; let nchunks=0, total=0, got=0;
+  for(let ch=0; ch<3; ch++){
+    const g=new Uint8ClampedArray(w*h*4);
+    for(let i=0;i<w*h*4;i+=4){ const v=data[i+ch]; g[i]=g[i+1]=g[i+2]=v; g[i+3]=255; }
+    const r=jsQR(g,w,h);
+    if(!r||!r.binaryData) return null;
+    const bd=r.binaryData, idx=bd[0]; nchunks=bd[1];
+    total=(bd[2]<<24)|(bd[3]<<16)|(bd[4]<<8)|bd[5];
+    if(chunks[idx]==null){ chunks[idx]=bd.slice(6); got++; }
+  }
+  if(got!==nchunks) return null;
+  const cl=chunks[0].length, all=new Uint8Array(nchunks*cl);
+  for(let i=0;i<nchunks;i++){ if(!chunks[i]) return null; all.set(chunks[i], i*cl); }
+  return all.slice(0,total);
+}
+function play(bytes){
+  if(!(bytes && bytes.length>12 && bytes[4]===0x66 && bytes[5]===0x74)){ status.textContent='⚠ decoded, but not a movie.'; return; }
+  film.src=URL.createObjectURL(new Blob([bytes],{type:'video/mp4'}));
+  film.play().catch(()=>{});
+  status.innerHTML='▶ playing — <b>'+bytes.length.toLocaleString()+' bytes</b> pulled from the 3 color channels of one QR. No network.';
+}
+async function autoload(){
+  try{
+    const img=new Image(); img.crossOrigin='anonymous'; img.src='colorqr.png?x='+Date.now(); await img.decode();
+    work.width=img.naturalWidth; work.height=img.naturalHeight; wx.drawImage(img,0,0);
+    const bytes=decodeColorQR(wx.getImageData(0,0,work.width,work.height).data, work.width, work.height);
+    if(bytes) return play(bytes);
+    throw 0;
+  }catch(e){ status.textContent='▶ playing the movie (direct file fallback).'; film.src='onemovie_color.mp4'; film.play().catch(()=>{}); }
+}
+// --- camera scan: YOUR web app opens the camera (not the stock one) ---
+let scanning=false, stream=null;
+document.getElementById('scanBtn').onclick=async()=>{
+  if(scanning){ scanning=false; stream&&stream.getTracks().forEach(t=>t.stop()); cam.style.display='none'; return; }
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
+    cam.srcObject=stream; cam.style.display='block'; await cam.play(); scanning=true;
+    status.textContent='📷 point at a color QR…';
+    const tick=()=>{ if(!scanning) return;
+      if(cam.videoWidth){ work.width=cam.videoWidth; work.height=cam.videoHeight; wx.drawImage(cam,0,0);
+        const d=wx.getImageData(0,0,work.width,work.height).data;
+        const bytes=decodeColorQR(d, work.width, work.height);
+        if(bytes){ scanning=false; stream.getTracks().forEach(t=>t.stop()); cam.style.display='none'; return play(bytes); }
+      }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }catch(e){ status.textContent='⚠ camera blocked — needs HTTPS + permission. The live link is HTTPS, so allow the camera.'; }
+};
+document.getElementById('replay').onclick=()=>{ film.currentTime=0; film.play(); };
+autoload();
+</script>
+</body>
+</html>
